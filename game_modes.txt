@@ -1,0 +1,18 @@
+main
+main_spring
+main_summer
+desert
+faction
+halloween
+potato
+potato_spring
+snow
+woods
+woods_snow
+woods_spring
+woods_summer
+savannah
+cobalt
+turkey
+may
+in config.ts modes:
