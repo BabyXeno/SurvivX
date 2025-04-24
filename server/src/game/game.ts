@@ -29,6 +29,7 @@ import { PlayerBarn } from "./objects/player";
 import { ProjectileBarn } from "./objects/projectile";
 import { SmokeBarn } from "./objects/smoke";
 import { PluginManager } from "./pluginManager";
+import { Profiler } from "./profiler";
 
 export interface JoinTokenData {
     expiresAt: number;
@@ -44,7 +45,7 @@ export interface JoinTokenData {
 export class Game {
     started = false;
     stopped = false;
-    allowJoin = true;
+    allowJoin = false;
     over = false;
     sentWinEMotes = false;
     startedTime = 0;
@@ -56,6 +57,12 @@ export class Game {
     config: ServerGameConfig;
     pluginManager = new PluginManager(this);
     modeManager: GameModeManager;
+
+    tickTimeWarnThreshold = (1000 / Config.gameTps) * 4;
+    gameTickWarnings = 0;
+
+    netSyncWarnThreshold = (1000 / Config.netSyncTps) * 4;
+    netSyncWarnings = 0;
 
     grid: Grid<GameObject>;
     objectRegister: ObjectRegister;
@@ -101,16 +108,18 @@ export class Game {
 
     start = Date.now();
 
+    profiler = new Profiler();
+
     constructor(
         id: string,
         config: ServerGameConfig,
         readonly sendSocketMsg: (id: string, data: Uint8Array) => void,
-        readonly closeSocket: (id: string) => void,
+        readonly closeSocket: (id: string, reason?: string) => void,
         readonly sendData?: (data: UpdateDataMsg) => void,
     ) {
         this.id = id;
         this.logger = new Logger(`Game #${this.id.substring(0, 4)}`);
-        this.logger.log("Creating");
+        this.logger.info("Creating");
 
         this.config = config;
 
@@ -149,16 +158,19 @@ export class Game {
 
     async init() {
         await this.pluginManager.loadPlugins();
-        this.pluginManager.emit("gameCreated", this);
         this.map.init();
+        this.pluginManager.emit("gameCreated", this);
 
         this.allowJoin = true;
-        this.logger.log(`Created in ${Date.now() - this.start} ms`);
+        this.logger.info(`Created in ${Date.now() - this.start} ms`);
 
         this.updateData();
     }
 
     update(): void {
+        if (!this.allowJoin) return;
+        this.profiler.flush();
+
         const now = performance.now();
         if (!this.now) this.now = now;
         const dt = math.clamp((now - this.now) / 1000, 0.001, 1 / 8);
@@ -185,33 +197,88 @@ export class Game {
         //
         // Update modules
         //
+        this.profiler.addSample("gas");
         this.gas.update(dt);
-        this.playerBarn.update(dt);
-        this.map.update(dt);
-        this.lootBarn.update(dt);
-        this.bulletBarn.update(dt);
-        this.projectileBarn.update(dt);
-        this.explosionBarn.update();
-        this.smokeBarn.update(dt);
-        this.airdropBarn.update(dt);
-        this.deadBodyBarn.update(dt);
-        this.decalBarn.update(dt);
-        this.planeBarn.update(dt);
+        this.profiler.endSample();
 
-        if (Config.perfLogging.enabled) {
-            // Record performance and start the next tick
-            // THIS TICK COUNTER IS WORKING CORRECTLY!
-            // It measures the time it takes to calculate a tick, not the time between ticks.
-            const tickTime = performance.now() - this.now;
+        this.profiler.addSample("players");
+        this.playerBarn.update(dt);
+        this.profiler.endSample();
+
+        this.profiler.addSample("map");
+        this.map.update(dt);
+        this.profiler.endSample();
+
+        this.profiler.addSample("loot");
+        this.lootBarn.update(dt);
+        this.profiler.endSample();
+
+        this.profiler.addSample("bullets");
+        this.bulletBarn.update(dt);
+        this.profiler.endSample();
+
+        this.profiler.addSample("projectiles");
+        this.projectileBarn.update(dt);
+        this.profiler.endSample();
+
+        this.profiler.addSample("explosions");
+        this.explosionBarn.update();
+        this.profiler.endSample();
+
+        this.profiler.addSample("smoke");
+        this.smokeBarn.update(dt);
+        this.profiler.endSample();
+
+        this.profiler.addSample("airdrops");
+        this.airdropBarn.update(dt);
+        this.profiler.endSample();
+
+        this.profiler.addSample("deadBodies");
+        this.deadBodyBarn.update(dt);
+        this.profiler.endSample();
+
+        this.profiler.addSample("decals");
+        this.decalBarn.update(dt);
+        this.profiler.endSample();
+
+        this.profiler.addSample("planes");
+        this.planeBarn.update(dt);
+        this.profiler.endSample();
+
+        const tickTime = performance.now() - this.now;
+
+        if (tickTime > 1000) {
+            let errString = `Tick took over 1 second! ${tickTime.toFixed(2)}ms\n`;
+            errString += "Profiler stats:\n";
+            errString += this.profiler.getStats();
+            this.logger.error(errString);
+        } else if (tickTime > this.tickTimeWarnThreshold) {
+            this.logger.warn(
+                `Tick took over ${this.tickTimeWarnThreshold}ms! ${tickTime.toFixed(2)}ms`,
+            );
+            this.gameTickWarnings++;
+
+            if (this.gameTickWarnings > 20) {
+                let errString = `Server is overloaded! Increasing tickTimeWarnThreshold.\n`;
+                errString += "Profiler stats:\n";
+                errString += this.profiler.getStats();
+                this.logger.warn(errString);
+
+                this.gameTickWarnings = 0;
+                this.tickTimeWarnThreshold *= 2;
+            }
+        }
+
+        if (Config.logging.debugLogs) {
             this.tickTimes.push(tickTime);
 
             this.perfTicker += dt;
-            if (this.perfTicker >= Config.perfLogging.time) {
+            if (this.perfTicker >= 15) {
                 this.perfTicker = 0;
                 const mspt =
                     this.tickTimes.reduce((a, b) => a + b) / this.tickTimes.length;
 
-                this.logger.log(
+                this.logger.debug(
                     `Avg ms/tick: ${mspt.toFixed(2)} | Load: ${((mspt / (1000 / Config.gameTps)) * 100).toFixed(1)}%`,
                 );
                 this.tickTimes = [];
@@ -220,6 +287,10 @@ export class Game {
     }
 
     netSync() {
+        if (!this.allowJoin) return;
+
+        const start = performance.now();
+
         // serialize objects and send msgs
         this.objectRegister.serializeObjs();
         this.playerBarn.sendMsgs();
@@ -237,6 +308,25 @@ export class Game {
         this.mapIndicatorBarn.flush();
 
         this.msgsToSend.stream.index = 0;
+
+        const syncTime = performance.now() - start;
+        if (syncTime > 1000) {
+            this.logger.error(`Tick took over 1 second! ${syncTime.toFixed(2)}ms`);
+        } else if (syncTime > this.netSyncWarnThreshold) {
+            this.logger.warn(
+                `Tick took over ${this.netSyncWarnThreshold}ms! ${syncTime.toFixed(2)}ms`,
+            );
+            this.netSyncWarnings++;
+
+            if (this.netSyncWarnings > 20) {
+                this.logger.warn(
+                    `Server is overloaded! Increasing netSyncWarnThreshold.`,
+                );
+
+                this.netSyncWarnings = 0;
+                this.netSyncWarnThreshold *= 2;
+            }
+        }
     }
 
     get canJoin(): boolean {
@@ -319,8 +409,7 @@ export class Game {
             msg = deserialized.msg;
             type = deserialized.type;
         } catch (err) {
-            this.logger.warn("Failed to deserialize msg: ");
-            console.error(err);
+            this.logger.error("Failed to deserialize msg: ", err);
             return;
         }
 
@@ -367,7 +456,7 @@ export class Game {
     handleSocketClose(socketId: string): void {
         const player = this.playerBarn.socketIdToPlayer.get(socketId);
         if (!player) return;
-        this.logger.log(`"${player.name}" left`);
+        this.logger.info(`"${player.name}" left`);
         player.disconnected = true;
         player.group?.checkPlayers();
         player.spectating = undefined;
@@ -437,7 +526,7 @@ export class Game {
                 this.closeSocket(player.socketId);
             }
         }
-        this.logger.log("Game Ended");
+        this.logger.info("Game Ended");
         this.updateData();
         this._saveGameToDatabase();
     }
